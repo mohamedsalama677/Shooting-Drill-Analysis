@@ -1,0 +1,12 @@
+services:
+  scout-drill-analysis:
+    build: .
+    image: scoutai-shooting-drill:latest
+    volumes:
+      - ./data/input:/app/data/input      # drop input videos here
+      - ./data/output:/app/data/output    # annotated video + reports appear here
+      - ./models:/app/models              # YOLO weights cached here
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Override the default entrypoint command at runtime:
+    # docker compose run scout-drill-analysis --video data/input/drill.mp4

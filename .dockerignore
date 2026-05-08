@@ -1,0 +1,9 @@
+.git
+.gitignore
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+data/output/*
+!data/output/.gitkeep
+Input/
