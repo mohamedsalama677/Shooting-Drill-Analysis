@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.vscode
+arch.md
+
+# Local videos, generated reports, and debug artifacts
+data/

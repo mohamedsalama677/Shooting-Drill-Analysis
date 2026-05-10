@@ -6,6 +6,14 @@ services:
       - ./data/input:/app/data/input      # drop input videos here
       - ./data/output:/app/data/output    # annotated video + reports appear here
       - ./models:/app/models              # YOLO weights cached here
+      # Source code mounts — edits on host take effect immediately, no rebuild.
+      - ./main.py:/app/main.py
+      - ./config:/app/config
+      - ./detection:/app/detection
+      - ./calibration:/app/calibration
+      - ./analysis:/app/analysis
+      - ./output:/app/output
+      - ./utils:/app/utils
     environment:
       - PYTHONUNBUFFERED=1
     # Override the default entrypoint command at runtime:
