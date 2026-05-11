@@ -98,3 +98,64 @@ COLOR_GATE = (255, 255, 0)       # cyan
 COLOR_TRAIL = (255, 0, 255)      # magenta
 COLOR_BANNER_BG = (0, 0, 0)
 COLOR_BANNER_TEXT = (0, 255, 255)
+
+# ── Goal detection (Roboflow hosted-inference goalpost model) ─────────────────
+# Feature 4 (scoring zone) and Feature 6 (missed distance) rely on a real
+# goal-mouth bbox. We hit Roboflow's hosted detect.roboflow.com endpoint with
+# the trained "goalpost-u6e0h" model and assemble the bbox from the returned
+# post / crossbar detections.
+ENABLE_GOAL_FEATURES = True
+
+# detect.roboflow.com/{model_id}/{version}?api_key=...
+ROBOFLOW_GOAL_MODEL_ID = "goalpost-u6e0h"
+ROBOFLOW_GOAL_MODEL_VERSION = 1   # only version 1 is publicly available
+ROBOFLOW_GOAL_CONFIDENCE = 5      # percent (0-100); model is conservative on small far goals
+ROBOFLOW_GOAL_OVERLAP = 40        # percent NMS overlap threshold
+ROBOFLOW_GOAL_TIMEOUT_S = 15.0    # request timeout (seconds)
+ROBOFLOW_API_ENV_VAR = "ROBO_API" # which env var holds the API key (see .env)
+# Reject detections whose bbox covers more than this fraction of either frame
+# dimension — the model occasionally returns a near-frame-sized false positive.
+ROBOFLOW_GOAL_MAX_FRAME_FRAC = 0.65
+
+# Shape filters applied to whatever class names the Roboflow model returns so
+# we still get sane geometry even if the model labels everything "goal_post".
+GOAL_POST_MIN_HEIGHT_PX = 80      # vertical post height
+GOAL_POST_MIN_ASPECT = 1.4        # height / width
+GOAL_CROSSBAR_MIN_WIDTH_PX = 80
+GOAL_CROSSBAR_MAX_ASPECT = 0.4
+
+# When the Roboflow model returns ≥2 post-like detections, the pair must
+# satisfy these to be accepted as the actual goal mouth.
+GOAL_MIN_POSTS_REQUIRED = 2
+GOAL_POST_PAIR_MIN_WIDTH_PX = 80
+GOAL_POST_PAIR_MAX_WIDTH_PX = 900
+GOAL_POST_Y_OVERLAP_MIN = 0.4
+GOAL_POST_MIN_Y_FRAC = 0.15       # post top below this fraction of frame height
+GOAL_POST_MAX_Y_FRAC = 0.95       # post bottom above this fraction of frame height
+
+# Manual override: set to (x1, y1, x2, y2) to short-circuit detection.
+# Leave as None to rely on the Roboflow detector.
+GOAL_MANUAL_BBOX = None
+
+GOAL_DEBUG_IMAGE_FILENAME = "debug_goal.png"
+
+# ── Scoring zone point values ─────────────────────────────────────────────────
+# Grid: 3 x-columns (0=left, 1=center, 2=right) × 2 y-rows (0=top, 1=bottom)
+GOAL_ZONE_POINTS = {
+    (0, 0): 10, (1, 0): 7, (2, 0): 10,
+    (0, 1): 5,  (1, 1): 3, (2, 1): 5,
+}
+GOAL_ZONE_NAMES = {
+    (0, 0): "TL", (1, 0): "TC", (2, 0): "TR",
+    (0, 1): "BL", (1, 1): "BC", (2, 1): "BR",
+}
+
+# ── Post-shot ball tracking for goal crossing / missed distance ───────────────
+GOAL_LOOKAHEAD_FRAMES = 90          # 3 s at 30 fps — covers ball travel to goal
+GOAL_BALL_PROXIMITY_RADIUS_PX = 120.0
+GOAL_MISS_TRACK_MAX_GAP = 6         # max consecutive frames with no detection
+GOAL_MISS_GEOMETRY_FALLBACK = True  # estimate goal center from calibration when no bbox
+
+# ── Drill validation ──────────────────────────────────────────────────────────
+DRILL_EXPECTED_SHOTS = 3
+DRILL_MAX_INTERVAL_S = 15.0

@@ -34,6 +34,18 @@ class ShotEvent:
     confidence: float = 0.0
     source: str = "scored"
     debug: dict = field(default_factory=dict)
+    # Per-frame pixel displacement vector at release — used to extrapolate the
+    # ball trajectory when post-shot tracking dies before the ball reaches the
+    # goal. None when the candidate had no usable next-frame observation.
+    velocity_vec_px_per_frame: Optional[Point] = None
+    # Feature 5 — gate error flag
+    outside_gate: Optional[bool] = None
+    # Feature 4 — goal detection & scoring zone
+    scored: Optional[bool] = None
+    scoring_zone: Optional[str] = None      # "TL","TC","TR","BL","BC","BR"
+    zone_points: Optional[int] = None
+    # Feature 6 — missed shot distance
+    missed_distance_m: Optional[float] = None
 
 
 @dataclass
@@ -544,6 +556,10 @@ def detect_shots_from_tracks(
 
     shots: List[ShotEvent] = []
     for index, candidate in enumerate(accepted, start=1):
+        dt_frames = max(1, candidate.frame_idx - candidate.previous_frame_idx)
+        dx = candidate.ball_pos_px[0] - candidate.previous_ball_pos_px[0]
+        dy = candidate.ball_pos_px[1] - candidate.previous_ball_pos_px[1]
+        velocity_vec = (dx / dt_frames, dy / dt_frames)
         shots.append(ShotEvent(
             index=index,
             frame_idx=candidate.previous_frame_idx,
@@ -553,6 +569,7 @@ def detect_shots_from_tracks(
             confidence=candidate.confidence,
             source=candidate.source,
             debug=candidate.to_debug_dict(),
+            velocity_vec_px_per_frame=velocity_vec,
         ))
 
     log.info(

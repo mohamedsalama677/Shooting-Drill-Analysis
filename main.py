@@ -7,7 +7,7 @@ Two-pass pipeline:
     Pass 2: for each detected shot, re-seek to that frame and run pose to
             determine which foot kicked.
 
-Outputs: data/output/annotated.mp4 + data/output/report.json
+Outputs: data/output/annotated_<input_stem>.mp4 + data/output/report.json
 """
 
 import argparse
@@ -19,17 +19,16 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from analysis.event_detector import (
-    detect_shots_from_tracks,
-)
-from analysis.shot_analyzer import determine_foot
+from analysis.drill_validator import DrillSummary, validate_drill
+from analysis.event_detector import _build_per_frame, detect_shots_from_tracks
+from analysis.shot_analyzer import analyze_shots, determine_foot
 from calibration.homography import (
     DegenerateCalibrationError,
     compute_homography,
 )
 from calibration.scale import compute_scale
 from config import settings
-from detection.cone_detector import ConeDetector
+from detection.cone_detector import ConeDetector, GoalDetector
 from detection.detector import Detector
 from detection.pose_estimator import PoseEstimator
 from detection.tracker import MultiBallTracker
@@ -37,9 +36,12 @@ from output.annotator import (
     draw_calibration_badge,
     draw_detections,
     draw_gate,
+    draw_goal_polygon,
     draw_multi_ball_trails,
     draw_scale_segment,
+    draw_scoring_zone,
     draw_shot_banner,
+    draw_shot_status_panel,
     draw_velocity_readout,
 )
 from output.report_generator import write_report
@@ -106,16 +108,36 @@ def _save_debug_calibration(
              f"{settings.DEBUG_CALIBRATION_FRAME_FILENAME}")
 
 
-def _initial_calibrate(
+def _calibrate_and_detect_goal(
     cap: cv2.VideoCapture,
     cone_detector: "ConeDetector",
+    goal_detector: Optional["GoalDetector"],
     output_dir: str,
-) -> Optional[Calibration]:
-    """Scan early frames until cone detection yields a usable calibration."""
+) -> Tuple[Optional[Calibration], Optional[Tuple[int, int, int, int]], Optional[np.ndarray]]:
+    """Single-pass scan: calibrate from cones AND detect goal bbox + polygon.
+
+    Cone detection stops as soon as a usable calibration is built, but goal
+    detection keeps running across all CALIBRATION_MAX_FRAMES so the largest
+    plausible goal across the early frames wins (per GoalDetector scoring).
+    """
     last_frame = None
     last_raw: list = []
     last_chosen: list = []
     cal: Optional[Calibration] = None
+    last_goal_frame = None
+    goal_polygon: Optional[np.ndarray] = None
+
+    if settings.GOAL_MANUAL_BBOX is not None:
+        log.info(f"Using manual goal bbox: {settings.GOAL_MANUAL_BBOX}")
+        goal_bbox: Optional[Tuple[int, int, int, int]] = settings.GOAL_MANUAL_BBOX
+        x1, y1, x2, y2 = settings.GOAL_MANUAL_BBOX
+        goal_polygon = np.array(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32
+        )
+        best_goal_score = float("inf")
+    else:
+        goal_bbox = None
+        best_goal_score = -1.0
 
     for attempt in range(settings.CALIBRATION_MAX_FRAMES):
         cap.set(cv2.CAP_PROP_POS_FRAMES, attempt)
@@ -123,18 +145,64 @@ def _initial_calibrate(
         if not ok:
             break
 
-        chosen, _candidates, raw_boxes = cone_detector.detect(frame)
-        last_frame, last_raw, last_chosen = frame, raw_boxes, chosen
+        if cal is None:
+            chosen, _candidates, raw_boxes = cone_detector.detect(frame)
+            last_frame, last_raw, last_chosen = frame, raw_boxes, chosen
+            cal = _calibration_from_cones(chosen)
+            if cal is not None:
+                log.info(f"Initial calibration on frame {attempt}: method={cal.method}")
 
-        cal = _calibration_from_cones(chosen)
-        if cal is not None:
-            log.info(f"Initial calibration on frame {attempt}: method={cal.method}")
-            break
+        # Goal detection hits the Roboflow API — costs quota and adds latency,
+        # so we sample only a few frames and keep the highest-scoring result.
+        # Skipped entirely when goal_detector is None (ENABLE_GOAL_FEATURES=False).
+        if (
+            goal_detector is not None
+            and settings.GOAL_MANUAL_BBOX is None
+            and attempt in (0, 15, 30, 45)
+        ):
+            result = goal_detector.detect_with_score(frame)
+            if result is not None:
+                bbox, score, polygon = result
+                if score > best_goal_score:
+                    best_goal_score = score
+                    goal_bbox = bbox
+                    goal_polygon = polygon
+                    last_goal_frame = frame.copy()
+                    log.info(
+                        f"Goal candidate @frame {attempt}: bbox={bbox} score={score:.0f}"
+                    )
 
     if last_frame is not None:
         _save_debug_calibration(output_dir, last_frame, last_raw, last_chosen)
+    if goal_bbox is None:
+        log.warning("No goal detected. Features 4 and 6 will be disabled.")
+    else:
+        log.info(f"Final goal bbox: {goal_bbox}")
+        if last_goal_frame is not None:
+            _save_debug_goal(output_dir, last_goal_frame, goal_bbox, goal_polygon)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    return cal
+    return cal, goal_bbox, goal_polygon
+
+
+def _save_debug_goal(
+    output_dir: str,
+    frame: np.ndarray,
+    goal_bbox: Tuple[int, int, int, int],
+    goal_polygon: Optional[np.ndarray] = None,
+) -> None:
+    """Save a debug frame with the goal polygon (perspective-correct) drawn."""
+    debug = frame.copy()
+    x1, y1, x2, y2 = goal_bbox
+    if goal_polygon is not None:
+        pts = goal_polygon.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(debug, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
+    else:
+        cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 0), 3)
+    cv2.putText(debug, "GOAL", (x1 + 6, y1 + 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+    out_path = os.path.join(output_dir, settings.GOAL_DEBUG_IMAGE_FILENAME)
+    cv2.imwrite(out_path, debug)
+    log.info(f"Debug goal image written to {out_path}")
 
 
 def _draw_calibration_overlay(frame: np.ndarray, cal: Calibration) -> None:
@@ -153,6 +221,7 @@ def _ball_speed_mps(p1, p2, dt_s, cal_value) -> float:
 
 
 def run(video_path: str, output_dir: str) -> dict:
+    video_path = video_path.replace("\\", "/")
     if not os.path.isfile(video_path):
         raise FileNotFoundError(video_path)
     os.makedirs(output_dir, exist_ok=True)
@@ -170,8 +239,19 @@ def run(video_path: str, output_dir: str) -> dict:
     detector = Detector()              # YOLOv8n (track): player + ball
     cone_detector = ConeDetector()     # YOLO-World: cones (zero-shot prompt)
 
-    # ── Initial calibration ─────────────────────────────────────────────────
-    cal = _initial_calibrate(cap, cone_detector, output_dir)
+    # Goal features (4: scoring zone, 6: missed distance) are off by default —
+    # auto-detection of small training goals is unreliable. Set
+    # ENABLE_GOAL_FEATURES = True in settings.py to opt in.
+    if settings.ENABLE_GOAL_FEATURES:
+        goal_detector = GoalDetector()
+    else:
+        log.info("Goal features disabled (settings.ENABLE_GOAL_FEATURES=False)")
+        goal_detector = None
+
+    # ── Initial calibration + goal detection (single pass) ──────────────────
+    cal, goal_bbox, goal_polygon = _calibrate_and_detect_goal(
+        cap, cone_detector, goal_detector, output_dir
+    )
     if cal is None:
         log.warning("Calibration failed (need ≥2 cones). "
                     "Inspect data/output/debug_calibration.png to see what "
@@ -182,7 +262,8 @@ def run(video_path: str, output_dir: str) -> dict:
 
     # ── Pass 1: multi-ball tracking, per-frame cone recal, annotated video ──
     tracker = MultiBallTracker()
-    annotated_path = os.path.join(output_dir, settings.ANNOTATED_VIDEO_FILENAME)
+    input_stem = os.path.splitext(os.path.basename(video_path))[0]
+    annotated_path = os.path.join(output_dir, f"annotated_{input_stem}.mp4")
     person_bboxes_per_frame: List[Optional[Tuple[float, float, float, float]]] = []
     calibrations_per_frame: List = []
     recal_count = 0
@@ -255,34 +336,80 @@ def run(video_path: str, output_dir: str) -> dict:
     )
 
     # ── Pass 2: determine foot for each shot ────────────────────────────────
+    # MediaPipe pose can fail on extreme kicking postures. Retry on nearby
+    # frames, but bias HEAVILY toward pre-contact frames. After contact the
+    # kicking foot follows through past the ball, so the *support* foot ends
+    # up closer to the ball position — giving the wrong answer.
     pose = PoseEstimator()
     foot_per_shot: List[Optional[str]] = []
+    foot_retry_offsets = [0, -1, -2, -3, -4]
     try:
         for shot in shots:
-            if shot.frame_idx >= len(person_bboxes_per_frame):
-                log.warning(f"No person frame available at shot frame {shot.frame_idx}")
-                foot_per_shot.append(None)
-                continue
-            person_bbox = person_bboxes_per_frame[shot.frame_idx]
-            if person_bbox is None:
-                log.warning(f"No person detected at shot frame {shot.frame_idx}")
-                foot_per_shot.append(None)
-                continue
-            cap.set(cv2.CAP_PROP_POS_FRAMES, shot.frame_idx)
-            ok, frame = cap.read()
-            if not ok:
-                foot_per_shot.append(None)
-                continue
-            foot = determine_foot(frame, person_bbox, shot.ball_pos_px, pose)
-            log.info(f"Shot #{shot.index} (track {shot.track_id}): foot = {foot}")
+            foot: Optional[str] = None
+            tried_offsets: List[int] = []
+            for offset in foot_retry_offsets:
+                target_frame = shot.frame_idx + offset
+                if target_frame < 0 or target_frame >= len(person_bboxes_per_frame):
+                    continue
+                person_bbox = person_bboxes_per_frame[target_frame]
+                if person_bbox is None:
+                    continue
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                foot = determine_foot(frame, person_bbox, shot.ball_pos_px, pose)
+                tried_offsets.append(offset)
+                if foot is not None:
+                    break
+            if foot is None:
+                log.warning(
+                    f"Shot #{shot.index}: foot detection failed at frames "
+                    f"{[shot.frame_idx + o for o in tried_offsets]}"
+                )
+            else:
+                log.info(f"Shot #{shot.index} (track {shot.track_id}): foot = {foot}")
             foot_per_shot.append(foot)
     finally:
         pose.close()
         cap.release()
 
+    # ── Features 4 / 5 / 6: goal crossing, gate error, missed distance ──────
+    per_frame_balls = _build_per_frame(tracker.trajectories)
+    analyze_shots(
+        shots=shots,
+        per_frame_all_balls=per_frame_balls,
+        goal_bbox=goal_bbox,
+        goal_polygon=goal_polygon,
+        cal_H=cal.H,
+        ordered_cones_px=cal.ordered_cones_px,
+        px_per_meter=cal.px_per_meter,
+        frame_width=width,
+        frame_height=height,
+    )
+
+    # ── Drill validation ─────────────────────────────────────────────────────
+    drill_result = validate_drill(shots, foot_per_shot, fps)
+    drill_summary_dict = {
+        "shots_total": drill_result.shots_total,
+        "shots_scored": drill_result.shots_scored,
+        "shots_missed": drill_result.shots_missed,
+        "outside_gate_count": drill_result.outside_gate_count,
+        "total_points": drill_result.total_points,
+        "shot_times_s": drill_result.shot_times_s,
+        "inter_shot_intervals_s": drill_result.inter_shot_intervals_s,
+        "timing_errors": drill_result.timing_errors,
+        "avg_velocity_mps": drill_result.avg_velocity_mps,
+        "max_velocity_mps": drill_result.max_velocity_mps,
+        "drill_valid": drill_result.drill_valid,
+        "validation_notes": drill_result.validation_notes,
+        "per_shot": drill_result.per_shot,
+    }
+
     # ── Re-render annotated video with shot banners ─────────────────────────
     _overlay_shot_banners(annotated_path, shots, foot_per_shot, fps,
-                          (width, height))
+                          (width, height), goal_bbox=goal_bbox,
+                          goal_polygon=goal_polygon)
 
     # ── Write JSON report ───────────────────────────────────────────────────
     calibration_meta = {
@@ -304,6 +431,7 @@ def run(video_path: str, output_dir: str) -> dict:
         frame_count=frame_idx,
         calibration=calibration_meta,
         output_path=report_path,
+        drill_summary=drill_summary_dict,
         debug=debug_payload,
     )
     log.info(f"Report written: {report_path}")
@@ -353,6 +481,8 @@ def _overlay_shot_banners(
     foot_per_shot: list,
     fps: float,
     frame_size: Tuple[int, int],
+    goal_bbox: Optional[Tuple[int, int, int, int]] = None,
+    goal_polygon: Optional[np.ndarray] = None,
 ) -> None:
     """Re-encode the annotated video with shot banners held for N frames."""
     if not shots:
@@ -374,7 +504,32 @@ def _overlay_shot_banners(
             break
         if idx in banner_frames:
             shot, foot = banner_frames[idx]
-            draw_shot_banner(frame, shot.index, foot, shot.velocity_mps)
+            draw_shot_banner(
+                frame,
+                shot.index,
+                foot,
+                shot.velocity_mps,
+                scored=getattr(shot, "scored", None),
+                scoring_zone=getattr(shot, "scoring_zone", None),
+                zone_points=getattr(shot, "zone_points", None),
+                outside_gate=getattr(shot, "outside_gate", None),
+                missed_distance_m=getattr(shot, "missed_distance_m", None),
+            )
+            if goal_bbox is not None:
+                draw_scoring_zone(
+                    frame,
+                    goal_bbox,
+                    highlight_zone=getattr(shot, "scoring_zone", None),
+                    points=getattr(shot, "zone_points", None),
+                )
+            draw_shot_status_panel(
+                frame,
+                shot_index=shot.index,
+                scored=getattr(shot, "scored", None),
+                scoring_zone=getattr(shot, "scoring_zone", None),
+                zone_points=getattr(shot, "zone_points", None),
+                missed_distance_m=getattr(shot, "missed_distance_m", None),
+            )
         writer.write(frame)
         idx += 1
 

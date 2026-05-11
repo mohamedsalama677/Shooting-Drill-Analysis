@@ -42,6 +42,7 @@ class Detector:
             conf=settings.YOLO_CONF_THRESHOLD,
             tracker=settings.YOLO_TRACKER,
             persist=True,
+            imgsz=640,
             verbose=False,
         )[0]
 
@@ -81,6 +82,7 @@ class Detector:
             frame,
             classes=[settings.COCO_CLASS_BALL],
             conf=settings.YOLO_BALL_FALLBACK_CONF_THRESHOLD,
+            imgsz=640,
             verbose=False,
         )[0]
         if results.boxes is None:

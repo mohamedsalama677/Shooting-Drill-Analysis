@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker run *)",
+      "Bash(MSYS_NO_PATHCONV=1 docker compose run --rm -T --entrypoint python scout-drill-analysis -c \"import cv2; img = cv2.imread\\('/app/data/output/ann_shot1.png'\\); print\\('shape:', img.shape\\)\")"
+    ]
+  }
+}

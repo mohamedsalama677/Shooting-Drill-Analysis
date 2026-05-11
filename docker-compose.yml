@@ -14,6 +14,8 @@ services:
       - ./analysis:/app/analysis
       - ./output:/app/output
       - ./utils:/app/utils
+    env_file:
+      - .env
     environment:
       - PYTHONUNBUFFERED=1
     # Override the default entrypoint command at runtime:
