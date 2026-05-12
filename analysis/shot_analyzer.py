@@ -1,6 +1,7 @@
 """Per-shot analysis: foot detection, scoring zone, gate error flag, missed distance."""
 
 import math
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -15,6 +16,28 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 Point = Tuple[float, float]
+
+# File-based debug log for goal crossing diagnostics.
+_goal_dbg_file = None
+
+
+def _goal_dbg(msg: str) -> None:
+    """Write a debug message to both stdout and the goal_debug.txt file."""
+    global _goal_dbg_file
+    print(msg, flush=True)
+    if _goal_dbg_file is not None:
+        _goal_dbg_file.write(msg + "\n")
+        _goal_dbg_file.flush()
+
+
+def _open_goal_dbg(output_dir: str) -> None:
+    """Open the goal debug log file in the given output directory."""
+    global _goal_dbg_file
+    if _goal_dbg_file is not None:
+        _goal_dbg_file.close()
+    path = os.path.join(output_dir, "goal_debug.txt")
+    _goal_dbg_file = open(path, "w")
+
 
 
 def determine_foot(
@@ -145,7 +168,10 @@ def _check_goal_crossing(
 
     Two-stage check:
       1. Greedy follow on per-frame ball detections — returns scored=True the
-         moment a tracked ball lands inside the polygon.
+         moment a tracked ball lands inside the polygon.  Candidates are
+         filtered for **directional consistency** with the shot's release
+         vector so stationary (resting) balls near the goal cannot be
+         confused with the in-flight shot ball.
       2. Trajectory extrapolation fallback — when the ball is lost before
          reaching the goal, project the shot's release vector forward from the
          last known position and test segment-vs-polygon intersection. Catches
@@ -160,6 +186,42 @@ def _check_goal_crossing(
     current_pos = ball_pos_px
     last_observed_frame = shot_frame_idx
     gap_count = 0
+    _goal_dbg(f"\n[GOAL-DBG] _check_goal_crossing: shot_frame={shot_frame_idx} "
+              f"ball_pos=({ball_pos_px[0]:.0f},{ball_pos_px[1]:.0f}) "
+              f"vel={velocity_vec_px_per_frame} "
+              f"goal_bbox={goal_bbox} lookahead={end_frame - shot_frame_idx}")
+
+    # We keep a running velocity updated from actual observations so the
+    # Stage-2 extrapolation reflects where the ball was *actually* heading.
+    prev_obs_pos = ball_pos_px
+    prev_obs_frame = shot_frame_idx
+    running_vel = velocity_vec_px_per_frame  # fallback = release vector
+
+    # Track the last position/velocity where the ball was still moving fast.
+    # If the tracker latches onto the player (who walks slowly toward the goal),
+    # we detect the velocity drop and revert to extrapolation from the last
+    # fast-moving position.
+    fast_pos = ball_pos_px
+    fast_vel = velocity_vec_px_per_frame
+    fast_frame = shot_frame_idx
+
+    # Precompute unit direction of the shot for angular filtering.
+    shot_dir_valid = False
+    shot_ux, shot_uy = 0.0, 0.0
+    shot_speed = 0.0
+    if velocity_vec_px_per_frame is not None:
+        shot_speed = math.hypot(velocity_vec_px_per_frame[0],
+                                velocity_vec_px_per_frame[1])
+        if shot_speed > 1e-3:
+            shot_ux = velocity_vec_px_per_frame[0] / shot_speed
+            shot_uy = velocity_vec_px_per_frame[1] / shot_speed
+            shot_dir_valid = True
+
+    # Maximum angular deviation (cosine) — ~60° half-cone.
+    _MIN_DIR_COS = 0.40
+    # If tracked velocity drops below this fraction of original shot speed,
+    # consider the tracker to have latched onto the wrong object (player, etc.).
+    _VEL_DROP_FRAC = 0.20
 
     for frame_idx in range(shot_frame_idx, end_frame):
         candidates = per_frame_all_balls[frame_idx] if frame_idx < n_frames else []
@@ -173,6 +235,25 @@ def _check_goal_crossing(
         best_dist = float("inf")
         for _, pos in candidates:
             d = math.hypot(pos[0] - current_pos[0], pos[1] - current_pos[1])
+
+            # --- directional consistency filter ---
+            # Skip candidates whose direction from the *shot origin* is
+            # substantially different from the shot's release vector. This
+            # prevents latching onto resting balls that happen to be close.
+            if shot_dir_valid and frame_idx > shot_frame_idx:
+                dx_from_origin = pos[0] - ball_pos_px[0]
+                dy_from_origin = pos[1] - ball_pos_px[1]
+                dist_from_origin = math.hypot(dx_from_origin, dy_from_origin)
+                # Only filter when the candidate is far enough from the kick
+                # point that the direction is meaningful (> 30 px).
+                if dist_from_origin > 30.0:
+                    cos_angle = (
+                        (dx_from_origin * shot_ux + dy_from_origin * shot_uy)
+                        / dist_from_origin
+                    )
+                    if cos_angle < _MIN_DIR_COS:
+                        continue  # off-trajectory — skip
+
             if d < best_dist:
                 best_pos, best_dist = pos, d
 
@@ -183,21 +264,76 @@ def _check_goal_crossing(
             continue
 
         gap_count = 0
+        # Update running velocity from observed trajectory.
+        dt = frame_idx - prev_obs_frame
+        if dt > 0:
+            running_vel = (
+                (best_pos[0] - prev_obs_pos[0]) / dt,
+                (best_pos[1] - prev_obs_pos[1]) / dt,
+            )
+            # --- velocity-drop detection ---
+            # If the tracked object's speed drops below _VEL_DROP_FRAC of the
+            # original shot speed, the tracker has almost certainly latched
+            # onto the player or a resting ball. Stop tracking and fall back
+            # to extrapolation from the last fast-moving position.
+            cur_speed = math.hypot(running_vel[0], running_vel[1])
+            if cur_speed >= _VEL_DROP_FRAC * shot_speed:
+                # Still fast — update the "last known fast" bookmark.
+                fast_pos = best_pos
+                fast_vel = running_vel
+                fast_frame = frame_idx
+            elif (frame_idx - shot_frame_idx) > 3 and shot_speed > 5.0:
+                # Velocity has dropped significantly — stop tracking.
+                _goal_dbg(f"[GOAL-DBG] Velocity drop at frame {frame_idx}: "
+                          f"cur_speed={cur_speed:.1f} vs shot_speed={shot_speed:.1f} "
+                          f"— reverting to fast_pos=({fast_pos[0]:.0f},{fast_pos[1]:.0f})")
+                break
+
+        prev_obs_pos = best_pos
+        prev_obs_frame = frame_idx
         current_pos = best_pos
         last_observed_frame = frame_idx
 
         if _point_in_goal(current_pos, goal_polygon, goal_bbox):
+            _goal_dbg(f"[GOAL-DBG] Stage1 HIT: ball tracked INTO goal at frame {frame_idx} "
+                      f"pos=({current_pos[0]:.0f},{current_pos[1]:.0f})")
             return True, current_pos
 
     # Stage 2: trajectory extrapolation when tracking dies before goal.
-    if velocity_vec_px_per_frame is not None:
+    # Always use the ORIGINAL release velocity for extrapolation direction.
+    # The running velocity from 1-5 frames of noisy tracking is unreliable —
+    # it often captures bounces to wrong objects (player, cones, etc.).
+    # The release velocity is the best available directional signal.
+    observed_count = last_observed_frame - shot_frame_idx
+    fast_observed = fast_frame - shot_frame_idx
+
+    # Choose the best starting position for extrapolation:
+    # - If we have a fast bookmark, start from there (closest to real ball path)
+    # - Otherwise start from the shot origin
+    extrap_pos = fast_pos if fast_observed > 0 else ball_pos_px
+    extrap_from_frame = fast_frame if fast_observed > 0 else shot_frame_idx
+
+    _goal_dbg(f"[GOAL-DBG] Stage1 done: tracking ended at frame {last_observed_frame} "
+              f"(observed {observed_count} frames, fast_observed={fast_observed}) "
+              f"final_pos=({current_pos[0]:.0f},{current_pos[1]:.0f}) "
+              f"extrap_from=({extrap_pos[0]:.0f},{extrap_pos[1]:.0f})")
+
+    # Require at least 1 frame of actual tracking for extrapolation.
+    # With 0 tracked frames, the release velocity alone is too unreliable
+    # (it would cause false GOALs for wide shots whose velocity vector
+    # happens to point near the goal).
+    if fast_observed < 1:
+        _goal_dbg(f"[GOAL-DBG] Skipping extrapolation: no tracking evidence "
+                  f"(fast_observed={fast_observed})")
+    elif velocity_vec_px_per_frame is not None:
         hit, hit_pos = _extrapolate_into_goal(
-            current_pos,
-            velocity_vec_px_per_frame,
-            last_observed_frame,
+            extrap_pos,
+            velocity_vec_px_per_frame,  # ALWAYS use original release velocity
+            extrap_from_frame,
             end_frame,
             goal_polygon,
             goal_bbox,
+            shot_frame_idx=shot_frame_idx,
         )
         if hit and hit_pos is not None:
             return True, hit_pos
@@ -212,6 +348,7 @@ def _extrapolate_into_goal(
     end_frame: int,
     goal_polygon: Optional[np.ndarray],
     goal_bbox: Tuple[int, int, int, int],
+    shot_frame_idx: int = 0,
 ) -> Tuple[bool, Optional[Point]]:
     """Project the shot's release vector from last_pos and test for goal entry.
 
@@ -219,22 +356,40 @@ def _extrapolate_into_goal(
     release vector is in pixels-per-frame, so a step of `i` corresponds to
     where the ball would be `i` frames after last_observed_frame, assuming
     constant velocity. First sample inside the polygon wins.
+
+    The extrapolation is capped at GOAL_EXTRAPOLATION_MAX_FRAMES to prevent
+    runaway projections when the ball is lost early and the velocity vector
+    is unreliable.
     """
     vx, vy = velocity_vec_px_per_frame
-    if math.hypot(vx, vy) < 1e-3:
+    speed_pxpf = math.hypot(vx, vy)
+    if speed_pxpf < 1e-3:
         return False, None
     frames_remaining = max(0, end_frame - last_observed_frame - 1)
     if frames_remaining == 0:
         return False, None
+
+    # Cap the extrapolation window to prevent runaway projections.
+    # 45 frames (~1.5 s at 30 fps) covers even slow shots.
+    # The caller already guards against zero-tracking cases.
+    _MAX_EXTRAPOLATION_FRAMES = 45
+    frames_remaining = min(frames_remaining, _MAX_EXTRAPOLATION_FRAMES)
+
     # Sub-frame sampling so we don't step over a thin polygon between frames.
     samples_per_frame = 4
     total_samples = frames_remaining * samples_per_frame
+    _goal_dbg(f"[GOAL-DBG] Extrapolating: from=({last_pos[0]:.0f},{last_pos[1]:.0f}) "
+              f"vel=({vx:.1f},{vy:.1f}) frames_remaining={frames_remaining} "
+              f"observed_frames={last_observed_frame - shot_frame_idx}")
     for i in range(1, total_samples + 1):
         t = i / samples_per_frame
         x = last_pos[0] + vx * t
         y = last_pos[1] + vy * t
         if _point_in_goal((x, y), goal_polygon, goal_bbox):
+            _goal_dbg(f"[GOAL-DBG] Extrapolation HIT at t={t:.1f} frames "
+                      f"pos=({x:.0f},{y:.0f})")
             return True, (float(x), float(y))
+    _goal_dbg(f"[GOAL-DBG] Extrapolation MISS — no intersection")
     return False, None
 
 
@@ -270,6 +425,7 @@ def compute_missed_distance(
     px_per_meter: Optional[float],
     frame_width: int,
     frame_height: int,
+    velocity_vec_px_per_frame: Optional[Point] = None,
 ) -> Optional[float]:
     """Track ball after shot, return distance in meters to nearest goalpost.
 
@@ -279,6 +435,18 @@ def compute_missed_distance(
     end_frame = min(n_frames, shot_frame_idx + settings.GOAL_LOOKAHEAD_FRAMES + 1)
     current_pos = ball_pos_px
     gap_count = 0
+
+    # Directional filter — same logic as _check_goal_crossing.
+    shot_dir_valid = False
+    shot_ux, shot_uy = 0.0, 0.0
+    if velocity_vec_px_per_frame is not None:
+        shot_speed = math.hypot(velocity_vec_px_per_frame[0],
+                                velocity_vec_px_per_frame[1])
+        if shot_speed > 1e-3:
+            shot_ux = velocity_vec_px_per_frame[0] / shot_speed
+            shot_uy = velocity_vec_px_per_frame[1] / shot_speed
+            shot_dir_valid = True
+    _MIN_DIR_COS = 0.40
 
     for frame_idx in range(shot_frame_idx, end_frame):
         candidates = per_frame_all_balls[frame_idx] if frame_idx < n_frames else []
@@ -294,6 +462,20 @@ def compute_missed_distance(
             bx, by = pos
             if bx < 0 or bx > frame_width or by < 0 or by > frame_height:
                 continue
+
+            # Directional consistency filter
+            if shot_dir_valid and frame_idx > shot_frame_idx:
+                dx_from_origin = bx - ball_pos_px[0]
+                dy_from_origin = by - ball_pos_px[1]
+                dist_from_origin = math.hypot(dx_from_origin, dy_from_origin)
+                if dist_from_origin > 30.0:
+                    cos_angle = (
+                        (dx_from_origin * shot_ux + dy_from_origin * shot_uy)
+                        / dist_from_origin
+                    )
+                    if cos_angle < _MIN_DIR_COS:
+                        continue
+
             d = math.hypot(bx - current_pos[0], by - current_pos[1])
             if d < best_dist:
                 best_pos, best_dist = pos, d
@@ -361,8 +543,11 @@ def analyze_shots(
     frame_width: int,
     frame_height: int,
     goal_polygon: Optional[np.ndarray] = None,
+    output_dir: Optional[str] = None,
 ) -> None:
     """Populate Feature 4/5/6 fields on each ShotEvent in-place."""
+    if output_dir is not None:
+        _open_goal_dbg(output_dir)
     for shot in shots:
         # Feature 5: outside gate check
         shot.outside_gate = check_outside_gate(
@@ -403,6 +588,9 @@ def analyze_shots(
                     px_per_meter,
                     frame_width,
                     frame_height,
+                    velocity_vec_px_per_frame=getattr(
+                        shot, "velocity_vec_px_per_frame", None
+                    ),
                 )
                 log.info(
                     f"Shot #{shot.index}: MISS dist={shot.missed_distance_m}"

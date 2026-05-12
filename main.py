@@ -386,6 +386,7 @@ def run(video_path: str, output_dir: str) -> dict:
         px_per_meter=cal.px_per_meter,
         frame_width=width,
         frame_height=height,
+        output_dir=output_dir,
     )
 
     # ── Drill validation ─────────────────────────────────────────────────────
@@ -421,7 +422,7 @@ def run(video_path: str, output_dir: str) -> dict:
         "recalibrations": recal_count,
     }
     debug_payload = _write_debug_artifacts(output_dir, tracker, shot_candidates)
-    report_path = os.path.join(output_dir, settings.REPORT_FILENAME)
+    report_path = os.path.join(output_dir, f"report_{input_stem}.json")
     payload = write_report(
         shots=shots,
         foot_per_shot=foot_per_shot,

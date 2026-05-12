@@ -354,6 +354,16 @@ class GoalDetector:
             cls = str(p.get("class", "")).lower()
             aspect = ph / pw
 
+            # Skip ball-only detections from soccer-and-soccer-goal-detect model.
+            # "soccer" without "goal" means it's a ball detection — not relevant.
+            if cls == "soccer" or (cls and "ball" in cls):
+                continue
+
+            # Explicit "goal" class from the new model → whole-goal detection.
+            if "goal" in cls:
+                whole.append((x1, y1, x2, y2, conf))
+                continue
+
             is_tall_post = (
                 ph >= settings.GOAL_POST_MIN_HEIGHT_PX
                 and aspect >= settings.GOAL_POST_MIN_ASPECT
@@ -368,9 +378,6 @@ class GoalDetector:
             elif is_tall_post:
                 posts.append((x1, y1, x2, y2, conf))
             elif is_wide_short:
-                # A wide short bbox from a "goalpost"-class model is the
-                # whole goal mouth (left post + crossbar + right post), not a
-                # bare crossbar. Treat it as a whole-goal candidate.
                 whole.append((x1, y1, x2, y2, conf))
             else:
                 # Catch-all (square-ish): goal mouth captured by a single bbox.
